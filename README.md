@@ -19,6 +19,12 @@ GPU add `--gpus all`
 docker run -it --gpus all -v $(pwd):/workspace state-model:v1 state --help
 docker: Error response from daemon: could not select device driver "" with capabilities: [[gpu]]
 ```
+Run Jupyter lab
+
+```
+docker run -it -v $(pwd):/workspace -p 8888:8888 state-model:v1 \
+    jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root
+```
 
 ## Run Inference
 1. To run inferecne for embedding
