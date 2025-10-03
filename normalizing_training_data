@@ -1,0 +1,127 @@
+conda activate scanpy_tut   # or scvi
+mkdir -p ~/vcc_norm
+cd ~/vcc_norm
+
+cat > normalize_vcc_chunked.py << 'PY'
+import os, sys, gc, argparse
+import numpy as np
+import scanpy as sc
+import anndata as ad
+from scipy import sparse
+
+def row_sums_csr(X):
+    return np.asarray(X.sum(axis=1)).ravel()
+
+def to_sparse_f32(X):
+    return (X.astype(np.float32) if sparse.issparse(X)
+            else sparse.csr_matrix(X).astype(np.float32))
+
+def compute_median_totals_chunked(path, chunk=20000, counts_layer=None):
+    bk = ad.read_h5ad(path, backed="r")
+    n = bk.n_obs
+    totals = np.empty(n, dtype=np.float64)
+    for i in range(0, n, chunk):
+        j = min(i+chunk, n)
+        # bring only this block into memory
+        block = bk[i:j, :].to_memory()
+        if counts_layer and counts_layer in (block.layers or {}):
+            X = block.layers[counts_layer]
+        else:
+            X = block.X
+        X = to_sparse_f32(X)
+        totals[i:j] = row_sums_csr(X)
+        del block, X
+        gc.collect()
+    med = float(np.median(totals))
+    bk.file.close()
+    return med, totals
+
+def pick_hvgs_from_subsample(path, n_cells=10000, n_top_genes=4000,
+                             counts_layer=None, flavor="seurat"):
+    bk = ad.read_h5ad(path, backed="r")
+    n = bk.n_obs
+    n_cells = min(n_cells, n)
+    idx = np.random.default_rng(0).choice(n, n_cells, replace=False)
+    sub = bk[idx, :].to_memory()
+    # choose counts matrix
+    X = (sub.layers[counts_layer] if counts_layer and counts_layer in (sub.layers or {})
+         else sub.X)
+    sub.layers["counts"] = to_sparse_f32(X)
+    # quick prefilter to speed HVG
+    sc.pp.filter_genes(sub, min_cells=max(100, int(0.005 * sub.n_obs)))
+    sc.pp.highly_variable_genes(sub, flavor=flavor, n_top_genes=n_top_genes,
+                                layer="counts", inplace=True)
+    hvg_names = sub.var_names[sub.var["highly_variable"]].to_list()
+    del sub; gc.collect()
+    bk.file.close()
+    return hvg_names
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", "-i", required=True)
+    ap.add_argument("--outdir", "-o", required=True)
+    ap.add_argument("--counts-layer", default=None,
+                    help="Layer with raw counts; if omitted, use X")
+    ap.add_argument("--use-hvg", action="store_true",
+                    help="Restrict to HVGs (memory saver)")
+    ap.add_argument("--hvg-cells", type=int, default=10000)
+    ap.add_argument("--hvg-genes", type=int, default=4000)
+    args = ap.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    # 1) exact median UMI via chunked pass (no big memory)
+    print("[INFO] Computing global median UMI in chunks …")
+    median_total, _ = compute_median_totals_chunked(args.input,
+                                                    chunk=20000,
+                                                    counts_layer=args.counts_layer)
+    print(f"[INFO] median_total = {median_total:.2f}")
+
+    # 2) choose gene set
+    if args.use_hvg:
+        print("[INFO] Picking HVGs from a subsample …")
+        hvg_names = pick_hvgs_from_subsample(args.input,
+                                             n_cells=args.hvg_cells,
+                                             n_top_genes=args.hvg_genes,
+                                             counts_layer=args.counts_layer,
+                                             flavor="seurat")
+        print(f"[INFO] Using {len(hvg_names)} HVGs")
+        # load only HVGs into memory
+        bk = ad.read_h5ad(args.input, backed="r")
+        adata = bk[:, hvg_names].to_memory()
+        bk.file.close()
+    else:
+        print("[INFO] Loading full matrix into memory (may be large) …")
+        adata = sc.read_h5ad(args.input)
+
+    # 3) set counts matrix (sparse float32)
+    if args.counts_layer and args.counts_layer in (adata.layers or {}):
+        adata.layers["counts"] = to_sparse_f32(adata.layers[args.counts_layer])
+    else:
+        adata.layers["counts"] = to_sparse_f32(adata.X)
+
+    # 4) normalize to global median UMI, then log1p
+    print("[INFO] Normalizing each cell to global median UMI …")
+    sc.pp.normalize_total(adata, target_sum=median_total,
+                          layer="counts", inplace=True)
+
+    # put normalized values into X and log1p
+    adata.X = adata.layers["counts"].copy()
+    print("[INFO] Applying log1p …")
+    sc.pp.log1p(adata)
+
+    # 5) write output
+    out_h5 = os.path.join(args.outdir, "vcc_log1p_norm.h5ad")
+    print(f"[INFO] Writing {out_h5} …")
+    adata.write(out_h5, compression="gzip")
+    print("[INFO] Done.")
+
+if __name__ == "__main__":
+    main()
+PY
+
+# run it (HVG mode strongly recommended on laptops)
+python normalize_vcc_chunked.py \
+  --input "/Volumes/Expansion/vcc_data/adata_Training.h5ad" \
+  --outdir ./vcc_norm_out \
+  --use-hvg --hvg-cells 10000 --hvg-genes 4000
